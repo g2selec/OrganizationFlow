@@ -1,5 +1,3 @@
-import os
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -281,22 +279,13 @@ if uploaded_file:
     """
 
     with st.sidebar:
-        st.markdown("---")
-        # Native Desktop Save Button
-        if st.button("💾 Save Interactive HTML to Desktop"):
-            try:
-                # Find the user's actual Desktop folder natively
-                desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-                file_name = f"Org_Flow_{selected_group.replace(' ', '_')}.html"
-                full_save_path = os.path.join(desktop_path, file_name)
-                
-                # Write the file directly to the hard drive
-                with open(full_save_path, "w", encoding="utf-8") as f:
-                    f.write(html_template)
-                    
-                st.success(f"✅ Saved directly to your Desktop as: **{file_name}**")
-            except Exception as e:
-                st.error(f"Failed to save: {e}")
+        st.download_button(
+            label="📥 Download Interactive HTML (For PDF Print)",
+            data=html_template,
+            file_name=f"Org_Flow_{selected_group.replace(' ', '_')}.html",
+            mime="text/html",
+            help="Download this file, open it in Chrome/Edge, and use 'Print to PDF' for perfect uncropped resolution!"
+        )
 
     # --- 5. RENDER FOOTER DASHBOARD ---
     st.markdown("---")

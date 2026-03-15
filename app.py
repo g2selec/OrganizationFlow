@@ -23,7 +23,7 @@ with st.sidebar:
     st.header("Data Input & Settings")
     uploaded_file = st.file_uploader("Upload Excel Data", type=["xlsx"])
     st.markdown("---")
-    start_depth = st.slider("Initial Explode Depth", min_value=1, max_value=6, value=4)
+    start_depth = st.slider("Initial Explode Depth", min_value=1, max_value=6, value=1)
     
     # 🌟 NEW: Clustering Toggle 🌟
     cluster_l7 = st.checkbox("Collapse L7 Employees into Clusters", value=True, help="Saves horizontal space by combining L7s into a single box.")

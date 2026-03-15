@@ -24,9 +24,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload Excel Data", type=["xlsx"])
     st.markdown("---")
     start_depth = st.slider("Initial Explode Depth", min_value=1, max_value=6, value=1)
-    
-    # 🌟 NEW: Clustering Toggle 🌟
-    cluster_l7 = st.checkbox("Collapse L7 Employees into Clusters", value=True, help="Saves horizontal space by combining L7s into a single box.")
+    cluster_l7 = st.checkbox("Collapse L7 Employees into Clusters", value=True)
 
 if uploaded_file:
     # Load Data & Clean
@@ -38,7 +36,8 @@ if uploaded_file:
     df_raw = df_raw.dropna(subset=["Name", "Role"])
     df_raw["Name"] = df_raw["Name"].astype(str).str.strip()
     
-    for col in ["Reports To", "Team No", "Governance Body / Committee", "Group", "Team Type"]:
+    # 🌟 Added "Domain" to the clean-up list 🌟
+    for col in ["Reports To", "Team No", "Governance Body / Committee", "Group", "Team Type", "Domain"]:
         if col in df_raw.columns:
             df_raw[col] = df_raw[col].fillna("").astype(str).str.strip().replace("nan", "")
         else:
@@ -52,17 +51,26 @@ if uploaded_file:
     else:
         df_raw['Mapped Level'] = np.nan
 
-    # --- GLOBAL CACHE ---
+    # --- GLOBAL CACHE & HEADCOUNT ENGINE ---
     df_raw_all = df_raw.copy()
     all_names_global = set(df_raw_all["Name"].tolist())
     
     top_level_heads = set()
     true_hods = set()
+    mgr_to_emps_dict = {}
+    emp_to_mgr_dict = {}
     
     for _, row in df_raw_all.iterrows():
         name = str(row["Name"]).strip()
         role = str(row["Role"]).strip()
         mgr = str(row["Reports To"]).strip()
+        
+        emp_to_mgr_dict[name] = mgr
+        
+        if mgr and mgr.lower() not in ["nan", "sir", ""]:
+            if mgr not in mgr_to_emps_dict:
+                mgr_to_emps_dict[mgr] = []
+            mgr_to_emps_dict[mgr].append(name)
         
         if "hod" in role.lower():
             true_hods.add(name)
@@ -74,9 +82,53 @@ if uploaded_file:
             top_level_heads.add(mgr)
             true_hods.add(mgr) 
 
-    emp_to_mgr_dict = dict(zip(df_raw_all["Name"], df_raw_all["Reports To"]))
-    # Set of all managers to ensure we don't accidentally cluster someone who has subordinates
+    # 🌟 NEW FIX: Pre-compute how many Teams a manager oversees in a silo 🌟
+    mgr_silo_teams = {}
+    for _, row in df_raw_all.iterrows():
+        m = str(row["Reports To"]).strip()
+        s = str(row["Group"]).strip()
+        if not s or s.lower() == "na":
+            s = "Ungrouped"
+        t = str(row["Team No"]).strip()
+        if m and t and t.lower() != "na":
+            key = f"{m}_{s}"
+            if key not in mgr_silo_teams:
+                mgr_silo_teams[key] = set()
+            mgr_silo_teams[key].add(t)
+
+    # Recursive math engine to calculate total reports
+    total_count_dict = {}
+    def get_total_reports(mgr_name, visited=None):
+        if visited is None: visited = set()
+        if mgr_name in visited: return 0 
+        visited.add(mgr_name)
+        
+        if mgr_name in total_count_dict:
+            return total_count_dict[mgr_name]
+        
+        directs = mgr_to_emps_dict.get(mgr_name, [])
+        total = len(directs)
+        for d in directs:
+            total += get_total_reports(d, visited.copy())
+            
+        total_count_dict[mgr_name] = total
+        return total
+
+    for emp_name in list(mgr_to_emps_dict.keys()) + list(all_names_global):
+        get_total_reports(emp_name)
+
     all_managers = set([str(v).strip() for v in emp_to_mgr_dict.values() if pd.notna(v)])
+
+    # --- STICKY NOTE EXTRACTION (G22 to G24) ---
+    sticky_text = ""
+    try:
+        df_notes = pd.read_excel(uploaded_file, sheet_name="Notes", header=None)
+        if df_notes.shape[0] >= 22 and df_notes.shape[1] >= 7:
+            notes_slice = df_notes.iloc[21:24, 6].dropna().astype(str).tolist()
+            if notes_slice:
+                sticky_text = "\n".join(notes_slice).strip()
+    except Exception as e:
+        pass
 
     # --- SMART GROUP & HOD FILTERING ---
     with st.sidebar:
@@ -117,7 +169,7 @@ if uploaded_file:
     node_data = {}      
     children_map = {}   
     built_nodes = {} 
-    l7_clusters = {} # 🌟 NEW: Holds our clustered employees 🌟
+    l7_clusters = {} 
 
     def add_node(node_id, label, color):
         if node_id not in node_data:
@@ -135,12 +187,27 @@ if uploaded_file:
         if node_id not in node_data:
             name = str(row.get("Name", "")).strip()
             role = str(row.get("Role", "")).strip()
+            
+            # 🌟 FIXED: Using Domain Column explicitly 🌟
+            domain = str(row.get("Domain", "")).strip()
+            
             if not role or role.lower() == "nan":
                 role = "HOD" if is_hod else "Unknown"
+            if not domain or domain.lower() == "nan" or domain.lower() == "na":
+                domain = "No Domain"
             
             lvl = row.get("Mapped Level")
             lvl_text = f"L{int(lvl)}" if pd.notna(lvl) else "Unmapped"
-            emp_label = f"{name}\n({role})\n[{lvl_text}]"
+            
+            direct_count = len(mgr_to_emps_dict.get(name, []))
+            total_count = total_count_dict.get(name, 0)
+            
+            if total_count > 0:
+                count_str = f"👥 D:{direct_count} | T:{total_count}"
+                emp_label = f"{name}\n({role} | {domain})\n[{lvl_text}]\n{count_str}"
+            else:
+                emp_label = f"{name}\n({role} | {domain})\n[{lvl_text}]"
+                
             node_color = "#ffeb99" if is_hod else "#fff2cc" 
             add_node(node_id, emp_label, node_color)
 
@@ -171,7 +238,22 @@ if uploaded_file:
 
             emp_id = f"EMP_{emp_name}"
             add_emp_node_from_row(emp_id, current_row, is_hod=is_true_hod)
-            add_edge(top_grp_id, emp_id)
+
+            emp_lvl = current_row.get("Mapped Level")
+            if pd.notna(emp_lvl):
+                gap = int(emp_lvl - 0) 
+                if gap > 1:
+                    missing_lvls = [f"L{l}" for l in range(1, int(emp_lvl))]
+                    missing_str = ", ".join(missing_lvls)
+                    missing_id = f"MISSING_{top_grp_id}_{missing_str.replace(' ', '_')}"
+
+                    add_node(missing_id, f"⚠️ Missing\n{missing_str}", "#ff9999")
+                    add_edge(top_grp_id, missing_id)
+                    add_edge(missing_id, emp_id)
+                else:
+                    add_edge(top_grp_id, emp_id)
+            else:
+                add_edge(top_grp_id, emp_id)
 
             built_nodes[cache_key] = emp_id
             return emp_id
@@ -185,7 +267,7 @@ if uploaded_file:
             if not mgr_rows.empty:
                 mgr_row = mgr_rows.iloc[0]
             else:
-                mgr_row = pd.Series({"Name": mgr_name, "Reports To": "Sir", "Role": "HOD", "Mapped Level": np.nan})
+                mgr_row = pd.Series({"Name": mgr_name, "Reports To": "Sir", "Role": "HOD", "Mapped Level": np.nan, "Group": emp_silo})
 
         parent_id = trace_up_node(mgr_name, emp_silo, mgr_row)
         is_mgr_top_level = mgr_name in top_level_heads
@@ -211,13 +293,21 @@ if uploaded_file:
             mgr_tno = str(mgr_row.get("Team No", "")).strip()
             
             if tno and tno.lower() != "na":
-                if tno != mgr_tno:
+                draw_team_box = True
+                
+                # 🌟 THE TEAM BOX BUG FIX 🌟
+                # Only skip the team box if the manager is explicitly listed as part of THIS team AND it's their ONLY team.
+                managed_teams = mgr_silo_teams.get(f"{mgr_name}_{emp_silo}", set())
+                if tno == mgr_tno and len(managed_teams) <= 1:
+                    draw_team_box = False
+                    
+                if draw_team_box:
                     tno_id = f"TNO_{emp_silo}_{mgr_name}_{tt}_{tno}"
                     add_node(tno_id, f"Team:\n{tno}", "#e6ccff")
                     add_edge(current_parent, tno_id)
                     current_parent = tno_id
 
-        # GAP VALIDATION (DETERMINE FINAL PARENT)
+        # GAP VALIDATION
         emp_lvl = current_row.get("Mapped Level")
         mgr_lvl = mgr_row.get("Mapped Level")
         final_parent = current_parent
@@ -240,13 +330,11 @@ if uploaded_file:
         # 🌟 THE CLUSTERING LOGIC 🌟
         emp_id = f"EMP_{emp_name}_{emp_silo}"
         
-        # If toggled ON, and they are L7, and they don't manage anyone -> Cluster them!
         if cluster_l7 and emp_lvl == 7 and emp_name not in all_managers:
             if final_parent not in l7_clusters:
                 l7_clusters[final_parent] = []
             l7_clusters[final_parent].append(emp_name)
         else:
-            # Build normally
             add_emp_node_from_row(emp_id, current_row, is_hod=is_true_hod)
             add_edge(final_parent, emp_id)
 
@@ -268,7 +356,7 @@ if uploaded_file:
         names.sort()
         names_str = "\n".join(names)
         label = f"👥 L7 Technicians ({len(names)})\n{names_str}"
-        add_node(cluster_id, label, "#e6f2ff") # A distinct light-blue color
+        add_node(cluster_id, label, "#e6f2ff")
         add_edge(parent_id, cluster_id)
 
     # --- 🌟 CUSTOM LEFT-TO-RIGHT SORTING 🌟 ---
@@ -318,15 +406,55 @@ if uploaded_file:
 
     final_tree_data = build_echarts_tree(gov_id)
 
+    # 🌟 BUILD THE TRUE FLOATING STICKY NOTE GRAPHIC 🌟
+    graphic_elements = []
+    if sticky_text:
+        lines = sticky_text.split('\n')
+        note_height = max(80, len(lines) * 20 + 60)
+        
+        graphic_elements.append({
+            "type": "group",
+            # "left": 40,  # Absolute positioning from top-left of canvas
+            # "top": 40,
+            "draggable": True, # Users can click and drag this note anywhere!
+            "children": [
+                {
+                    "type": "rect",
+                    "z": 100,
+                    "shape": { "width": 280, "height": note_height },
+                    "style": {
+                        "fill": "#fff9c4", # Light post-it yellow
+                        "stroke": "#fbc02d",
+                        "lineWidth": 1,
+                        "shadowBlur": 8,
+                        "shadowColor": "rgba(0,0,0,0.2)" # Floating drop shadow
+                    }
+                },
+                {
+                    "type": "text",
+                    "z": 101,
+                    "left": 15,
+                    "top": 15,
+                    "style": {
+                        "text": f"📌 Governance Notes:\n\n{sticky_text}",
+                        "fill": "#333",
+                        "font": "13px Arial",
+                        "lineHeight": 20
+                    }
+                }
+            ]
+        })
+
     # --- 4. RENDER FULL-WIDTH CHART ---
     options = {
         "tooltip": {"trigger": "item", "triggerOn": "mousemove"},
+        "graphic": graphic_elements, # Inject the floating note here
         "series": [
             {
                 "type": "tree",
                 "data": [final_tree_data],
                 "orient": "TB", 
-                "top": "5%", "bottom": "5%", "left": "2%", "right": "2%",
+                "top": "8%", "bottom": "8%", "left": "2%", "right": "2%",
                 "symbolSize": 12, 
                 "initialTreeDepth": start_depth, 
                 "roam": True, 

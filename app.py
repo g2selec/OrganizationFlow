@@ -36,7 +36,6 @@ if uploaded_file:
     df_raw = df_raw.dropna(subset=["Name", "Role"])
     df_raw["Name"] = df_raw["Name"].astype(str).str.strip()
     
-    # 🌟 Added "Domain" to the clean-up list 🌟
     for col in ["Reports To", "Team No", "Governance Body / Committee", "Group", "Team Type", "Domain"]:
         if col in df_raw.columns:
             df_raw[col] = df_raw[col].fillna("").astype(str).str.strip().replace("nan", "")
@@ -51,26 +50,18 @@ if uploaded_file:
     else:
         df_raw['Mapped Level'] = np.nan
 
-    # --- GLOBAL CACHE & HEADCOUNT ENGINE ---
+    # --- GLOBAL CACHE & ROW-LOCKED HEADCOUNT ENGINE ---
     df_raw_all = df_raw.copy()
     all_names_global = set(df_raw_all["Name"].tolist())
     
     top_level_heads = set()
     true_hods = set()
-    mgr_to_emps_dict = {}
-    emp_to_mgr_dict = {}
+    mgr_to_emps_dict = {} # Now using sets to prevent double-counting matrix employees
     
     for _, row in df_raw_all.iterrows():
         name = str(row["Name"]).strip()
         role = str(row["Role"]).strip()
         mgr = str(row["Reports To"]).strip()
-        
-        emp_to_mgr_dict[name] = mgr
-        
-        if mgr and mgr.lower() not in ["nan", "sir", ""]:
-            if mgr not in mgr_to_emps_dict:
-                mgr_to_emps_dict[mgr] = []
-            mgr_to_emps_dict[mgr].append(name)
         
         if "hod" in role.lower():
             true_hods.add(name)
@@ -80,9 +71,13 @@ if uploaded_file:
             
         if mgr and mgr.lower() not in ["nan", "sir", ""] and mgr not in all_names_global:
             top_level_heads.add(mgr)
-            true_hods.add(mgr) 
+            true_hods.add(mgr)
+            
+        if mgr and mgr.lower() not in ["nan", "sir", ""]:
+            if mgr not in mgr_to_emps_dict:
+                mgr_to_emps_dict[mgr] = set()
+            mgr_to_emps_dict[mgr].add(name)
 
-    # 🌟 NEW FIX: Pre-compute how many Teams a manager oversees in a silo 🌟
     mgr_silo_teams = {}
     for _, row in df_raw_all.iterrows():
         m = str(row["Reports To"]).strip()
@@ -96,30 +91,30 @@ if uploaded_file:
                 mgr_silo_teams[key] = set()
             mgr_silo_teams[key].add(t)
 
-    # Recursive math engine to calculate total reports
-    total_count_dict = {}
+    # Recursive math engine to calculate total unique reports
+    total_reports_cache = {}
     def get_total_reports(mgr_name, visited=None):
         if visited is None: visited = set()
-        if mgr_name in visited: return 0 
+        if mgr_name in visited: return set() 
         visited.add(mgr_name)
         
-        if mgr_name in total_count_dict:
-            return total_count_dict[mgr_name]
+        if mgr_name in total_reports_cache:
+            return total_reports_cache[mgr_name]
         
-        directs = mgr_to_emps_dict.get(mgr_name, [])
-        total = len(directs)
+        directs = mgr_to_emps_dict.get(mgr_name, set())
+        all_reports = set(directs)
         for d in directs:
-            total += get_total_reports(d, visited.copy())
+            all_reports.update(get_total_reports(d, visited.copy()))
             
-        total_count_dict[mgr_name] = total
-        return total
+        total_reports_cache[mgr_name] = all_reports
+        return all_reports
 
     for emp_name in list(mgr_to_emps_dict.keys()) + list(all_names_global):
         get_total_reports(emp_name)
 
-    all_managers = set([str(v).strip() for v in emp_to_mgr_dict.values() if pd.notna(v)])
+    all_managers = set(mgr_to_emps_dict.keys())
 
-    # --- STICKY NOTE EXTRACTION (G22 to G24) ---
+    # --- STICKY NOTE EXTRACTION ---
     sticky_text = ""
     try:
         df_notes = pd.read_excel(uploaded_file, sheet_name="Notes", header=None)
@@ -130,7 +125,7 @@ if uploaded_file:
     except Exception as e:
         pass
 
-    # --- SMART GROUP & HOD FILTERING ---
+    # --- SMART GROUP & HOD FILTERING (ROW LOCKED) ---
     with st.sidebar:
         st.markdown("---")
         st.header("Filter & Export")
@@ -141,26 +136,50 @@ if uploaded_file:
         unique_groups = sorted(list(set(g for g in df_raw["Group"].tolist() if g and g.lower() != "na")))
         selected_group = st.selectbox("Select Group to View:", ["All Groups"] + unique_groups)
 
-    def get_ultimate_hod(emp_name):
-        curr = emp_name
+    # 🌟 NEW FIX: Row-Locked HOD Tracing 🌟
+    def get_row_ultimate_hod(emp_name, emp_silo, current_row):
+        curr_name = emp_name
+        curr_silo = emp_silo
+        curr_row = current_row
         visited = set()
-        while curr:
-            if curr in visited: 
+        
+        while curr_name:
+            if curr_name in visited: break
+            visited.add(curr_name)
+            
+            if curr_name in true_hods:
+                return curr_name
+                
+            mgr_name = str(curr_row.get("Reports To", "")).strip()
+            if not mgr_name or mgr_name.lower() in ["nan", "sir", ""]:
                 break
-            visited.add(curr)
-            if curr in true_hods:
-                return curr
-            mgr = emp_to_mgr_dict.get(curr)
-            if not mgr or str(mgr).lower() in ["nan", "sir", ""]:
-                break
-            curr = str(mgr).strip()
+                
+            mgr_rows = df_raw_all[(df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == curr_silo)]
+            if not mgr_rows.empty:
+                curr_row = mgr_rows.iloc[0]
+            else:
+                mgr_rows = df_raw_all[df_raw_all["Name"] == mgr_name]
+                if not mgr_rows.empty:
+                    curr_row = mgr_rows.iloc[0]
+                else:
+                    break
+            curr_name = mgr_name
+            
         return None
 
     if selected_group != "All Groups":
         df_raw = df_raw[df_raw["Group"] == selected_group]
 
     if selected_hod != "All HODs":
-        df_raw = df_raw[df_raw["Name"].apply(get_ultimate_hod) == selected_hod]
+        keep_mask = []
+        for _, row in df_raw.iterrows():
+            e_name = str(row["Name"]).strip()
+            e_silo = str(row["Group"]).strip()
+            if not e_silo or e_silo.lower() == "na":
+                e_silo = "Ungrouped"
+            uhod = get_row_ultimate_hod(e_name, e_silo, row)
+            keep_mask.append(uhod == selected_hod)
+        df_raw = df_raw[keep_mask]
 
     all_names = set(df_raw["Name"].tolist())
 
@@ -187,8 +206,6 @@ if uploaded_file:
         if node_id not in node_data:
             name = str(row.get("Name", "")).strip()
             role = str(row.get("Role", "")).strip()
-            
-            # 🌟 FIXED: Using Domain Column explicitly 🌟
             domain = str(row.get("Domain", "")).strip()
             
             if not role or role.lower() == "nan":
@@ -199,8 +216,8 @@ if uploaded_file:
             lvl = row.get("Mapped Level")
             lvl_text = f"L{int(lvl)}" if pd.notna(lvl) else "Unmapped"
             
-            direct_count = len(mgr_to_emps_dict.get(name, []))
-            total_count = total_count_dict.get(name, 0)
+            direct_count = len(mgr_to_emps_dict.get(name, set()))
+            total_count = len(total_reports_cache.get(name, set()))
             
             if total_count > 0:
                 count_str = f"👥 D:{direct_count} | T:{total_count}"
@@ -294,9 +311,6 @@ if uploaded_file:
             
             if tno and tno.lower() != "na":
                 draw_team_box = True
-                
-                # 🌟 THE TEAM BOX BUG FIX 🌟
-                # Only skip the team box if the manager is explicitly listed as part of THIS team AND it's their ONLY team.
                 managed_teams = mgr_silo_teams.get(f"{mgr_name}_{emp_silo}", set())
                 if tno == mgr_tno and len(managed_teams) <= 1:
                     draw_team_box = False
@@ -414,20 +428,20 @@ if uploaded_file:
         
         graphic_elements.append({
             "type": "group",
-            # "left": 40,  # Absolute positioning from top-left of canvas
+            # "left": 40, 
             # "top": 40,
-            "draggable": True, # Users can click and drag this note anywhere!
+            "draggable": True, 
             "children": [
                 {
                     "type": "rect",
                     "z": 100,
                     "shape": { "width": 280, "height": note_height },
                     "style": {
-                        "fill": "#fff9c4", # Light post-it yellow
+                        "fill": "#fff9c4", 
                         "stroke": "#fbc02d",
                         "lineWidth": 1,
                         "shadowBlur": 8,
-                        "shadowColor": "rgba(0,0,0,0.2)" # Floating drop shadow
+                        "shadowColor": "rgba(0,0,0,0.2)"
                     }
                 },
                 {
@@ -448,7 +462,7 @@ if uploaded_file:
     # --- 4. RENDER FULL-WIDTH CHART ---
     options = {
         "tooltip": {"trigger": "item", "triggerOn": "mousemove"},
-        "graphic": graphic_elements, # Inject the floating note here
+        "graphic": graphic_elements, 
         "series": [
             {
                 "type": "tree",

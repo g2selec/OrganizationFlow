@@ -475,7 +475,7 @@ if uploaded_file:
                 "roam": True, 
                 "expandAndCollapse": True,
                 "animationDuration": 550, "animationDurationUpdate": 750,
-                "edgeShape": "polyline", 
+                "edgeShape": "curve", 
                 "lineStyle": {"width": 2, "color": "#aaa"},
                 "label": {"position": "bottom", "verticalAlign": "middle", "align": "center"},
                 "leaves": {"label": {"position": "bottom", "verticalAlign": "middle", "align": "center"}}

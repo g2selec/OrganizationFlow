@@ -393,6 +393,7 @@ if uploaded_file:
         node_info = node_data[node_id]
         
         tree_node = {
+            "id": node_id,
             "name": node_info["name"],
             "label": {
                 "backgroundColor": node_info["color"],

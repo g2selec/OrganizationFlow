@@ -2,19 +2,25 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
+import warnings
 from streamlit_echarts import st_echarts
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # --- 1. PAGE SETUP & CSS OPTIMIZATION ---
 st.set_page_config(layout="wide", page_title="Org Flow Dashboard")
 
-st.markdown("""
+st.markdown(
+    """
     <style>
         .block-container {
             padding-top: 2rem !important;
             padding-bottom: 0rem !important;
         }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.markdown("### 📊 Org Flow Architecture")
 
@@ -23,7 +29,7 @@ with st.sidebar:
     st.header("Data Input & Settings")
     uploaded_file = st.file_uploader("Upload Excel Data", type=["xlsx"])
     st.markdown("---")
-    start_depth = st.slider("Initial Explode Depth", min_value=1, max_value=6, value=1)
+    start_depth = st.slider("Initial Explode Depth", min_value=1, max_value=10, value=1)
     cluster_l7 = st.checkbox("Collapse L7 Employees into Clusters", value=True)
 
 if uploaded_file:
@@ -35,44 +41,63 @@ if uploaded_file:
 
     df_raw = df_raw.dropna(subset=["Name", "Role"])
     df_raw["Name"] = df_raw["Name"].astype(str).str.strip()
-    
-    for col in ["Reports To", "Team No", "Governance Body / Committee", "Group", "Team Type", "Domain"]:
+
+    for col in [
+        "Reports To",
+        "Team No",
+        "Governance Body / Committee",
+        "Group",
+        "Team Type",
+        "Domain",
+    ]:
         if col in df_raw.columns:
-            df_raw[col] = df_raw[col].fillna("").astype(str).str.strip().replace("nan", "")
+            df_raw[col] = (
+                df_raw[col].fillna("").astype(str).str.strip().replace("nan", "")
+            )
         else:
-            df_raw[col] = "" 
+            df_raw[col] = ""
 
     # --- LEVEL ENGINE ---
-    if 'Role' in df_dd.columns and 'Level' in df_dd.columns:
-        role_to_level = dict(zip(df_dd['Role'], df_dd['Level']))
-        df_raw['Mapped Level'] = df_raw['Role'].map(role_to_level).astype(str).str.upper().str.replace('L', '')
-        df_raw['Mapped Level'] = pd.to_numeric(df_raw['Mapped Level'], errors='coerce')
+    if "Role" in df_dd.columns and "Level" in df_dd.columns:
+        role_to_level = dict(zip(df_dd["Role"], df_dd["Level"]))
+        df_raw["Mapped Level"] = (
+            df_raw["Role"]
+            .map(role_to_level)
+            .astype(str)
+            .str.upper()
+            .str.replace("L", "")
+        )
+        df_raw["Mapped Level"] = pd.to_numeric(df_raw["Mapped Level"], errors="coerce")
     else:
-        df_raw['Mapped Level'] = np.nan
+        df_raw["Mapped Level"] = np.nan
 
     # --- GLOBAL CACHE & ROW-LOCKED HEADCOUNT ENGINE ---
     df_raw_all = df_raw.copy()
     all_names_global = set(df_raw_all["Name"].tolist())
-    
+
     top_level_heads = set()
     true_hods = set()
-    mgr_to_emps_dict = {} # Now using sets to prevent double-counting matrix employees
-    
+    mgr_to_emps_dict = {}
+
     for _, row in df_raw_all.iterrows():
         name = str(row["Name"]).strip()
         role = str(row["Role"]).strip()
         mgr = str(row["Reports To"]).strip()
-        
+
         if "hod" in role.lower():
             true_hods.add(name)
-            
+
         if not mgr or mgr.lower() in ["nan", "sir", ""]:
             top_level_heads.add(name)
-            
-        if mgr and mgr.lower() not in ["nan", "sir", ""] and mgr not in all_names_global:
+
+        if (
+            mgr
+            and mgr.lower() not in ["nan", "sir", ""]
+            and mgr not in all_names_global
+        ):
             top_level_heads.add(mgr)
             true_hods.add(mgr)
-            
+
         if mgr and mgr.lower() not in ["nan", "sir", ""]:
             if mgr not in mgr_to_emps_dict:
                 mgr_to_emps_dict[mgr] = set()
@@ -93,19 +118,22 @@ if uploaded_file:
 
     # Recursive math engine to calculate total unique reports
     total_reports_cache = {}
+
     def get_total_reports(mgr_name, visited=None):
-        if visited is None: visited = set()
-        if mgr_name in visited: return set() 
+        if visited is None:
+            visited = set()
+        if mgr_name in visited:
+            return set()
         visited.add(mgr_name)
-        
+
         if mgr_name in total_reports_cache:
             return total_reports_cache[mgr_name]
-        
+
         directs = mgr_to_emps_dict.get(mgr_name, set())
         all_reports = set(directs)
         for d in directs:
             all_reports.update(get_total_reports(d, visited.copy()))
-            
+
         total_reports_cache[mgr_name] = all_reports
         return all_reports
 
@@ -113,6 +141,60 @@ if uploaded_file:
         get_total_reports(emp_name)
 
     all_managers = set(mgr_to_emps_dict.keys())
+
+    # 🌟 NEW PRE-COMPUTATION: Domain-Level De-Duplicated Math Engine 🌟
+    domain_unique_emps = {}
+    domain_direct_heads = {}
+
+    for _, row in df_raw_all.iterrows():
+        e_name = str(row["Name"]).strip()
+        e_silo = str(row["Group"]).strip()
+
+        curr_name = e_name
+        curr_silo = e_silo
+        curr_row = row
+        visited = set()
+
+        domain = "Ungrouped Domain"
+        top_head = None
+
+        # Trace up to find the ultimate Domain and Top Head for this row
+        while curr_name:
+            if curr_name in visited:
+                break
+            visited.add(curr_name)
+
+            if curr_name in top_level_heads:
+                top_head = curr_name
+                domain = str(curr_row.get("Group", "")).strip()
+                if not domain or domain.lower() == "na":
+                    domain = "Ungrouped Domain"
+                break
+
+            mgr_name = str(curr_row.get("Reports To", "")).strip()
+            if not mgr_name or mgr_name.lower() in ["nan", "sir", ""]:
+                break
+
+            mgr_rows = df_raw_all[
+                (df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == curr_silo)
+            ]
+            if not mgr_rows.empty:
+                curr_row = mgr_rows.iloc[0]
+            else:
+                mgr_rows = df_raw_all[df_raw_all["Name"] == mgr_name]
+                if not mgr_rows.empty:
+                    curr_row = mgr_rows.iloc[0]
+                else:
+                    break
+            curr_name = mgr_name
+
+        # Add to sets (Automatically drops duplicates!)
+        if top_head:
+            if domain not in domain_unique_emps:
+                domain_unique_emps[domain] = set()
+                domain_direct_heads[domain] = set()
+            domain_unique_emps[domain].add(e_name)
+            domain_direct_heads[domain].add(top_head)
 
     # --- STICKY NOTE EXTRACTION ---
     sticky_text = ""
@@ -129,32 +211,46 @@ if uploaded_file:
     with st.sidebar:
         st.markdown("---")
         st.header("Filter & Export")
-        
+
         unique_hods = sorted(list(true_hods))
         selected_hod = st.selectbox("Select HOD to View:", ["All HODs"] + unique_hods)
-        
-        unique_groups = sorted(list(set(g for g in df_raw["Group"].tolist() if g and g.lower() != "na")))
-        selected_group = st.selectbox("Select Group to View:", ["All Groups"] + unique_groups)
 
-    # 🌟 NEW FIX: Row-Locked HOD Tracing 🌟
+        unique_groups = sorted(
+            list(set(g for g in df_raw["Group"].tolist() if g and g.lower() != "na"))
+        )
+        selected_group = st.selectbox(
+            "Select Group to View:", ["All Groups"] + unique_groups
+        )
+
+        # 🌟 NEW: STREAMLIT TOGGLE FOR THE STICKY NOTE 🌟
+        st.markdown("---")
+        expand_notes = st.checkbox(
+            "📌 Expand Governance Notes",
+            value=False,
+            help="Click to expand the floating sticky note on the canvas.",
+        )
+
     def get_row_ultimate_hod(emp_name, emp_silo, current_row):
         curr_name = emp_name
         curr_silo = emp_silo
         curr_row = current_row
         visited = set()
-        
+
         while curr_name:
-            if curr_name in visited: break
+            if curr_name in visited:
+                break
             visited.add(curr_name)
-            
+
             if curr_name in true_hods:
                 return curr_name
-                
+
             mgr_name = str(curr_row.get("Reports To", "")).strip()
             if not mgr_name or mgr_name.lower() in ["nan", "sir", ""]:
                 break
-                
-            mgr_rows = df_raw_all[(df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == curr_silo)]
+
+            mgr_rows = df_raw_all[
+                (df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == curr_silo)
+            ]
             if not mgr_rows.empty:
                 curr_row = mgr_rows.iloc[0]
             else:
@@ -164,7 +260,7 @@ if uploaded_file:
                 else:
                     break
             curr_name = mgr_name
-            
+
         return None
 
     if selected_group != "All Groups":
@@ -185,10 +281,10 @@ if uploaded_file:
 
     # --- 3. ECHARTS TREE BUILDER ENGINE ---
     missing_level_alerts = []
-    node_data = {}      
-    children_map = {}   
-    built_nodes = {} 
-    l7_clusters = {} 
+    node_data = {}
+    children_map = {}
+    built_nodes = {}
+    l7_clusters = {}
 
     def add_node(node_id, label, color):
         if node_id not in node_data:
@@ -207,35 +303,40 @@ if uploaded_file:
             name = str(row.get("Name", "")).strip()
             role = str(row.get("Role", "")).strip()
             domain = str(row.get("Domain", "")).strip()
-            
+
             if not role or role.lower() == "nan":
                 role = "HOD" if is_hod else "Unknown"
             if not domain or domain.lower() == "nan" or domain.lower() == "na":
                 domain = "No Domain"
-            
+
             lvl = row.get("Mapped Level")
             lvl_text = f"L{int(lvl)}" if pd.notna(lvl) else "Unmapped"
-            
+
             direct_count = len(mgr_to_emps_dict.get(name, set()))
             total_count = len(total_reports_cache.get(name, set()))
-            
+
             if total_count > 0:
                 count_str = f"👥 D:{direct_count} | T:{total_count}"
                 emp_label = f"{name}\n({role} | {domain})\n[{lvl_text}]\n{count_str}"
             else:
                 emp_label = f"{name}\n({role} | {domain})\n[{lvl_text}]"
-                
-            node_color = "#ffeb99" if is_hod else "#fff2cc" 
+
+            node_color = "#ffeb99" if is_hod else "#fff2cc"
             add_node(node_id, emp_label, node_color)
 
     gov_id = "GOV_MAIN"
-    add_node(gov_id, "Governance Body\n(Sir) [L0]", "#ffcccc")
+    total_company_headcount = len(all_names_global)
+    add_node(
+        gov_id,
+        f"Governance Body\n(Sir) [L0]\n👥 Total Org: {total_company_headcount}",
+        "#ffcccc",
+    )
 
     # 🌟 THE ROW-LOCKED RECURSIVE ENGINE 🌟
     def trace_up_node(emp_name, emp_silo, current_row):
         is_top_level = emp_name in top_level_heads
         is_true_hod = emp_name in true_hods
-        
+
         cache_key = emp_name if is_top_level else f"{emp_name}_{emp_silo}"
 
         if cache_key in built_nodes:
@@ -250,7 +351,13 @@ if uploaded_file:
                 hod_grp = "Ungrouped Domain"
 
             top_grp_id = f"TOP_GRP_{hod_grp}"
-            add_node(top_grp_id, f"🏢 {hod_grp}", "#ffd27f")
+
+            # 🌟 INJECT DE-DUPLICATED METRICS INTO DOMAIN BOX 🌟
+            domain_d = len(domain_direct_heads.get(hod_grp, set()))
+            domain_t = len(domain_unique_emps.get(hod_grp, set()))
+            domain_label = f"🏢 {hod_grp}\n👥 D:{domain_d} | T:{domain_t}"
+
+            add_node(top_grp_id, domain_label, "#ffd27f")
             add_edge(gov_id, top_grp_id)
 
             emp_id = f"EMP_{emp_name}"
@@ -258,7 +365,7 @@ if uploaded_file:
 
             emp_lvl = current_row.get("Mapped Level")
             if pd.notna(emp_lvl):
-                gap = int(emp_lvl - 0) 
+                gap = int(emp_lvl - 0)
                 if gap > 1:
                     missing_lvls = [f"L{l}" for l in range(1, int(emp_lvl))]
                     missing_str = ", ".join(missing_lvls)
@@ -267,6 +374,10 @@ if uploaded_file:
                     add_node(missing_id, f"⚠️ Missing\n{missing_str}", "#ff9999")
                     add_edge(top_grp_id, missing_id)
                     add_edge(missing_id, emp_id)
+
+                    alert_msg = f"Under **Governance (Sir)** in {hod_grp}, missing **{missing_str}** detected!"
+                    if alert_msg not in missing_level_alerts:
+                        missing_level_alerts.append(alert_msg)
                 else:
                     add_edge(top_grp_id, emp_id)
             else:
@@ -276,7 +387,9 @@ if uploaded_file:
             return emp_id
 
         # --- TIER 2: RECURSE UP TO MANAGER ---
-        mgr_rows = df_raw_all[(df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == emp_silo)]
+        mgr_rows = df_raw_all[
+            (df_raw_all["Name"] == mgr_name) & (df_raw_all["Group"] == emp_silo)
+        ]
         if not mgr_rows.empty:
             mgr_row = mgr_rows.iloc[0]
         else:
@@ -284,7 +397,15 @@ if uploaded_file:
             if not mgr_rows.empty:
                 mgr_row = mgr_rows.iloc[0]
             else:
-                mgr_row = pd.Series({"Name": mgr_name, "Reports To": "Sir", "Role": "HOD", "Mapped Level": np.nan, "Group": emp_silo})
+                mgr_row = pd.Series(
+                    {
+                        "Name": mgr_name,
+                        "Reports To": "Sir",
+                        "Role": "HOD",
+                        "Mapped Level": np.nan,
+                        "Group": emp_silo,
+                    }
+                )
 
         parent_id = trace_up_node(mgr_name, emp_silo, mgr_row)
         is_mgr_top_level = mgr_name in top_level_heads
@@ -308,13 +429,13 @@ if uploaded_file:
             tno = str(current_row.get("Team No", "")).strip()
             tt = str(current_row.get("Team Type", "")).strip()
             mgr_tno = str(mgr_row.get("Team No", "")).strip()
-            
+
             if tno and tno.lower() != "na":
                 draw_team_box = True
                 managed_teams = mgr_silo_teams.get(f"{mgr_name}_{emp_silo}", set())
                 if tno == mgr_tno and len(managed_teams) <= 1:
                     draw_team_box = False
-                    
+
                 if draw_team_box:
                     tno_id = f"TNO_{emp_silo}_{mgr_name}_{tt}_{tno}"
                     add_node(tno_id, f"Team:\n{tno}", "#e6ccff")
@@ -343,7 +464,7 @@ if uploaded_file:
 
         # 🌟 THE CLUSTERING LOGIC 🌟
         emp_id = f"EMP_{emp_name}_{emp_silo}"
-        
+
         if cluster_l7 and emp_lvl == 7 and emp_name not in all_managers:
             if final_parent not in l7_clusters:
                 l7_clusters[final_parent] = []
@@ -361,7 +482,7 @@ if uploaded_file:
         emp_silo = str(row["Group"]).strip()
         if not emp_silo or emp_silo.lower() == "na":
             emp_silo = "Ungrouped"
-            
+
         trace_up_node(emp_name, emp_silo, row)
 
     # 🌟 BUILD THE L7 CLUSTER NODES 🌟
@@ -378,20 +499,22 @@ if uploaded_file:
         "TOP_GRP_Electrical": 1,
         "TOP_GRP_Process": 2,
         "TOP_GRP_Power Electronics": 3,
-        "TOP_GRP_G4-PS": 4,   
-        "TOP_GRP_G4-VFD": 5   
+        "TOP_GRP_G4-PS": 4,
+        "TOP_GRP_G4-VFD": 5,
     }
     if gov_id in children_map:
         children_map[gov_id].sort(key=lambda x: custom_order.get(x, 99))
 
     # --- PHASE 4: NESTED JSON ---
     def build_echarts_tree(node_id, visited=None):
-        if visited is None: visited = set()
-        if node_id in visited: return None 
+        if visited is None:
+            visited = set()
+        if node_id in visited:
+            return None
         visited.add(node_id)
-        
+
         node_info = node_data[node_id]
-        
+
         tree_node = {
             "id": node_id,
             "name": node_info["name"],
@@ -399,90 +522,143 @@ if uploaded_file:
                 "backgroundColor": node_info["color"],
                 "borderColor": "#555",
                 "borderWidth": 1,
-                "padding": [8, 10], 
+                "padding": [8, 10],
                 "borderRadius": 5,
                 "color": "#000",
                 "fontSize": 12,
                 "lineHeight": 18,
-                "align": "center"
-            }
+                "align": "center",
+            },
         }
-        
+
         children = []
         for child_id in children_map.get(node_id, []):
             child_tree = build_echarts_tree(child_id, visited.copy())
             if child_tree:
                 children.append(child_tree)
-                
+
         if children:
             tree_node["children"] = children
-            
+
         return tree_node
 
     final_tree_data = build_echarts_tree(gov_id)
 
-    # 🌟 BUILD THE TRUE FLOATING STICKY NOTE GRAPHIC 🌟
+    # 🌟 BUILD THE TRUE FLOATING STICKY NOTE GRAPHIC (TOGGLABLE) 🌟
     graphic_elements = []
     if sticky_text:
-        lines = sticky_text.split('\n')
-        note_height = max(80, len(lines) * 20 + 60)
-        
-        graphic_elements.append({
-            "type": "group",
-            # "left": 40, 
-            # "top": 40,
-            "draggable": True, 
-            "children": [
+        if expand_notes:
+            # 📌 FULL EXPANDED NOTE
+            lines = sticky_text.split("\n")
+            note_height = max(80, len(lines) * 20 + 60)
+
+            graphic_elements.append(
                 {
-                    "type": "rect",
-                    "z": 100,
-                    "shape": { "width": 280, "height": note_height },
-                    "style": {
-                        "fill": "#fff9c4", 
-                        "stroke": "#fbc02d",
-                        "lineWidth": 1,
-                        "shadowBlur": 8,
-                        "shadowColor": "rgba(0,0,0,0.2)"
-                    }
-                },
-                {
-                    "type": "text",
-                    "z": 101,
-                    "left": 15,
-                    "top": 15,
-                    "style": {
-                        "text": f"📌 Governance Notes:\n\n{sticky_text}",
-                        "fill": "#333",
-                        "font": "13px Arial",
-                        "lineHeight": 20
-                    }
+                    "type": "group",
+                    "draggable": True,
+                    "left": 40,
+                    "top": 40,
+                    "children": [
+                        {
+                            "type": "rect",
+                            "z": 100,
+                            "shape": {"width": 280, "height": note_height},
+                            "style": {
+                                "fill": "#fff9c4",
+                                "stroke": "#fbc02d",
+                                "lineWidth": 1,
+                                "shadowBlur": 8,
+                                "shadowColor": "rgba(0,0,0,0.2)",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "z": 101,
+                            "left": 15,
+                            "top": 15,
+                            "style": {
+                                "text": f"📌 Governance Notes:\n\n{sticky_text}",
+                                "fill": "#333",
+                                "font": "13px Arial",
+                                "lineHeight": 20,
+                            },
+                        },
+                    ],
                 }
-            ]
-        })
+            )
+        else:
+            # 📌 CONDENSED PIN ICON
+            graphic_elements.append(
+                {
+                    "type": "group",
+                    "draggable": True,
+                    "left": 40,
+                    "top": 40,
+                    "children": [
+                        {
+                            "type": "rect",
+                            "z": 100,
+                            "shape": {"width": 45, "height": 45, "r": 8},
+                            "style": {
+                                "fill": "#fff9c4",
+                                "stroke": "#fbc02d",
+                                "lineWidth": 1,
+                                "shadowBlur": 5,
+                                "shadowColor": "rgba(0,0,0,0.2)",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "z": 101,
+                            "left": 12,
+                            "top": 13,
+                            "style": {
+                                "text": "📌",
+                                "fill": "#333",
+                                "font": "18px Arial",
+                            },
+                        },
+                    ],
+                }
+            )
 
     # --- 4. RENDER FULL-WIDTH CHART ---
     options = {
         "tooltip": {"trigger": "item", "triggerOn": "mousemove"},
-        "graphic": graphic_elements, 
+        "graphic": graphic_elements,
         "series": [
             {
                 "type": "tree",
                 "data": [final_tree_data],
-                "orient": "TB", 
-                "top": "8%", "bottom": "8%", "left": "2%", "right": "2%",
-                "symbolSize": 12, 
-                "initialTreeDepth": start_depth, 
-                "roam": True, 
+                "orient": "TB",
+                "top": "8%",
+                "bottom": "8%",
+                "left": "2%",
+                "right": "2%",
+                "symbolSize": 12,
+                "initialTreeDepth": start_depth,
+                "roam": True,
                 "expandAndCollapse": True,
-                "animationDuration": 550, "animationDurationUpdate": 750,
-                "edgeShape": "curve", 
+                "animationDuration": 550,
+                "animationDurationUpdate": 750,
+                "edgeShape": "curve",
                 "lineStyle": {"width": 2, "color": "#aaa"},
-                "label": {"position": "bottom", "verticalAlign": "middle", "align": "center"},
-                "leaves": {"label": {"position": "bottom", "verticalAlign": "middle", "align": "center"}}
+                "label": {
+                    "position": "bottom",
+                    "verticalAlign": "middle",
+                    "align": "center",
+                },
+                "leaves": {
+                    "label": {
+                        "position": "bottom",
+                        "verticalAlign": "middle",
+                        "align": "center",
+                    }
+                },
             }
-        ]
+        ],
     }
-    
+
     st_echarts(options=options, height="800px")
 
     # --- THE MAGIC HTML EXPORTER ---
@@ -514,14 +690,14 @@ if uploaded_file:
             label="📥 Download Interactive HTML",
             data=html_template,
             file_name=f"Org_Flow_Export.html",
-            mime="text/html"
+            mime="text/html",
         )
 
     # --- 5. RENDER FOOTER DASHBOARD ---
     st.markdown("---")
-    
+
     sum_col1, sum_col2, sum_col3 = st.columns(3)
-    
+
     with sum_col1:
         st.subheader("Data Summary")
         st.metric("Total Employees", len(df_raw))
@@ -536,9 +712,9 @@ if uploaded_file:
 
     with sum_col3:
         st.subheader("Unmapped Roles")
-        unmapped = df_raw[df_raw['Mapped Level'].isna()]
+        unmapped = df_raw[df_raw["Mapped Level"].isna()]
         if not unmapped.empty:
-            st.dataframe(unmapped[['Name', 'Role']], hide_index=True)
+            st.dataframe(unmapped[["Name", "Role"]], hide_index=True)
         else:
             st.success("All roles mapped perfectly!")
 
